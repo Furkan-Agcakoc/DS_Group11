@@ -4,6 +4,13 @@ The room host is the only writer of a room's state. Ties are broken by the order
 correct guesses arrive at the host (a per-room sequence number), so no client clocks are needed.
 Every answered guess is stored with its guess ID, so a guess that a client resends after a
 host crash is answered again but never counted twice.
+
+Players who leave a running game are not removed:
+  offline  - connection lost (crash, closed window, `leave`): the seat is kept for REJOIN_GRACE
+             seconds; the player can come back with the same name (or automatically after a
+             host crash, with the player ID).
+  kicked   - connected but no guess for AFK_TIMEOUT seconds while still having to guess:
+             removed from the game for good, no rejoin. The score stays in the ranking.
 """
 
 import random
@@ -25,6 +32,7 @@ class Player:
         self.id = player_id
         self.name = name
         self.connected = True
+        self.kicked = False
         self.score = 0
         self.answers = {}  # guess_id -> [feedback, attempts] of every counted guess
         self.reset_round()
@@ -38,17 +46,22 @@ class Player:
     def done(self):
         return self.solved or self.attempts >= config.MAX_ATTEMPTS
 
+    @property
+    def status(self):
+        return "kicked" if self.kicked else "online" if self.connected else "offline"
+
     def to_dict(self):
         return {
-            "id": self.id, "name": self.name, "connected": self.connected, "score": self.score,
-            "attempts": self.attempts, "solved": self.solved, "solved_seq": self.solved_seq,
-            "answers": self.answers,
+            "id": self.id, "name": self.name, "connected": self.connected, "kicked": self.kicked,
+            "score": self.score, "attempts": self.attempts, "solved": self.solved,
+            "solved_seq": self.solved_seq, "answers": self.answers,
         }
 
     @classmethod
     def from_dict(cls, d):
         p = cls(d["id"], d["name"])
         p.connected = d["connected"]
+        p.kicked = d["kicked"]
         p.score = d["score"]
         p.attempts = d["attempts"]
         p.solved = d["solved"]
@@ -67,10 +80,31 @@ class Room:
         self.seq = 0            # counts accepted guesses in arrival order
         self.players = {}       # player_id -> Player, in join order
         self.lock = threading.RLock()  # held by the server while it changes this room
-        self.disconnected_since = {}   # player_id -> local time of disconnect (not replicated)
+        # Local clocks of the host, not replicated: a promoted backup starts them anew.
+        self.disconnected_since = {}   # player_id -> time of disconnect (rejoin grace)
+        self.last_active = {}          # player_id -> time of the last guess (AFK check)
         self._rng = rng or random.Random()
 
     # --- Membership ---------------------------------------------------------------
+    def join(self, name):
+        """JOIN with a name: a new player before the start, a rejoin during the game.
+
+        Returns (player, rejoined).
+        """
+        name = name.strip() or "player"
+        existing = next((p for p in self.players.values() if p.name == name), None)
+        if self.state == WAITING:
+            if existing:
+                raise GameError(f"name '{name}' is taken in this room")
+            return self.add_player(name), False
+        if self.state == FINISHED:
+            raise GameError("game is over")
+        if existing is None:
+            raise GameError("game already started")
+        if existing.connected:
+            raise GameError(f"'{name}' is still playing in this room")
+        return self.rejoin(existing.id), True
+
     def add_player(self, name):
         if self.state != WAITING:
             raise GameError("game already started")
@@ -105,19 +139,56 @@ class Room:
         player = self.players.get(player_id)
         if player is None:
             raise GameError("unknown player")
+        if player.kicked:
+            raise GameError("you were removed from this game for inactivity")
         since = self.disconnected_since.get(player_id)
         if since is not None and time.monotonic() - since > config.REJOIN_GRACE:
             raise GameError(f"seat expired after {config.REJOIN_GRACE:.0f} s")
         self.set_connected(player_id, True)
+        self.last_active[player_id] = time.monotonic()
         return player
 
     def all_disconnected(self):
         """Called on the backup when it takes over: everybody has to rejoin within the grace period."""
         for pid in self.players:
             self.set_connected(pid, False)
+        self.last_active.clear()
 
     def connected_players(self):
         return [p for p in self.players.values() if p.connected]
+
+    # --- Inactivity ----------------------------------------------------------------------
+    def afk_players(self):
+        """Connected players who still have to guess but sent no guess for AFK_TIMEOUT seconds."""
+        if self.state != PLAYING:
+            return []
+        now = time.monotonic()
+        return [p for p in self.players.values()
+                if p.connected and not p.done
+                and now - self.last_active.setdefault(p.id, now) > config.AFK_TIMEOUT]
+
+    def kick(self, player_id):
+        player = self.players[player_id]
+        player.kicked = True
+        self.set_connected(player_id, False)
+        return player
+
+    def nobody_left(self):
+        """True if no player can play any more: everyone kicked or offline beyond the grace period."""
+        if self.state != PLAYING:
+            return False
+        now = time.monotonic()
+        for p in self.players.values():
+            if p.connected:
+                return False
+            since = self.disconnected_since.get(p.id)
+            if not p.kicked and (since is None or now - since <= config.REJOIN_GRACE):
+                return False
+        return True
+
+    def end_game(self):
+        self.state = FINISHED
+        self.secret = None
 
     # --- Game flow ----------------------------------------------------------------
     def start(self):
@@ -131,8 +202,10 @@ class Room:
     def _new_round(self):
         self.round += 1
         self.secret = self._rng.randint(config.NUMBER_MIN, config.NUMBER_MAX)
+        now = time.monotonic()
         for p in self.players.values():
             p.reset_round()
+            self.last_active[p.id] = now  # everybody gets the full AFK time in a new round
 
     def guess(self, player_id, guess_id, value):
         """Evaluate a guess. Returns (feedback, attempts, duplicate).
@@ -142,6 +215,7 @@ class Room:
         player = self.players.get(player_id)
         if player is None:
             raise GameError("unknown player")
+        self.last_active[player_id] = time.monotonic()
         if guess_id in player.answers:
             feedback, attempts = player.answers[guess_id]
             return feedback, attempts, True
@@ -186,20 +260,20 @@ class Room:
         result = {"round": self.round, "secret": self.secret, "ranking": ranking,
                   "scores": self.scoreboard()}
         if self.round >= config.ROUNDS:
-            self.state = FINISHED
-            self.secret = None
+            self.end_game()
         else:
             self._new_round()
         return result
 
     def scoreboard(self):
-        return [{"name": p.name, "score": p.score, "connected": p.connected}
+        return [{"name": p.name, "score": p.score, "connected": p.connected, "status": p.status}
                 for p in sorted(self.players.values(), key=lambda p: -p.score)]
 
     def summary(self):
         """Public room info for room lists (never contains the secret)."""
         return {"room_id": self.id, "name": self.name, "state": self.state,
-                "players": len(self.players), "max_players": config.MAX_PLAYERS}
+                "players": len(self.players), "online": len(self.connected_players()),
+                "max_players": config.MAX_PLAYERS}
 
     # --- Replication ---------------------------------------------------------------------
     def to_dict(self):

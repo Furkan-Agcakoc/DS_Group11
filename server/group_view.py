@@ -91,7 +91,8 @@ class GroupView:
             entry = self.rooms.get(summary["room_id"])
             if entry is None:
                 return False
-            entry.update(state=summary["state"], players=summary["players"])
+            entry.update(state=summary["state"], players=summary["players"],
+                         online=summary.get("online", 0))
             self.version += 1
             return True
 

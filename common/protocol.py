@@ -34,6 +34,7 @@ GAME_OVER = "GAME_OVER"
 PING = "PING"
 PONG = "PONG"
 LEAVE = "LEAVE"
+KICKED = "KICKED"                 # host -> client: removed for inactivity (no auto-rejoin)
 ERROR = "ERROR"
 
 # discovery (UDP)

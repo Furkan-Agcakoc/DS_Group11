@@ -16,7 +16,8 @@ HEARTBEAT_INTERVAL = 1.0    # M3: server <-> leader heartbeats (UDP)
 HEARTBEAT_MISSES = 3        # M3: node counts as crashed after 3 missed heartbeats
 PING_INTERVAL = 2.0         # client -> room host ping (TCP)
 PING_TIMEOUT = 6.0          # host marks client as disconnected after 6 s without a ping
-REJOIN_GRACE = 60.0         # M4: seat and score are kept for 60 s
+REJOIN_GRACE = 60.0         # offline player: seat and score are kept for 60 s
+AFK_TIMEOUT = 30.0          # connected player without a guess for 30 s is removed from the game
 REPLICATION_TIMEOUT = 1.0   # M4: wait for ACK from the backup
 REPLICATION_RETRIES = 3     # M4: then the backup is reported as failed
 

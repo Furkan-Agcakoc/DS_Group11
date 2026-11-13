@@ -65,6 +65,61 @@ class RoomTest(unittest.TestCase):
         with self.assertRaises(GameError):
             backup.rejoin("someone-else")
 
+    def test_rejoin_by_name_after_going_offline(self):
+        self.room.start()
+        self.room.guess(self.bob.id, new_id(), self.room.secret)
+        self.room.remove_player(self.bob.id)              # leave / crash during the game
+        player, rejoined = self.room.join("Bob")
+        self.assertTrue(rejoined)
+        self.assertIs(player, self.bob)
+        self.assertEqual((player.attempts, player.solved), (1, True))
+
+    def test_join_by_name_refused_while_online_or_unknown(self):
+        self.room.start()
+        with self.assertRaises(GameError):
+            self.room.join("Bob")                         # Bob is still connected
+        with self.assertRaises(GameError):
+            self.room.join("Carol")                       # new players cannot join a running game
+
+    def test_afk_player_is_kicked_and_cannot_rejoin(self):
+        self.room.start()
+        self.room.last_active[self.bob.id] -= config.AFK_TIMEOUT + 1
+        self.assertEqual(self.room.afk_players(), [self.bob])
+        self.room.kick(self.bob.id)
+        self.assertEqual(self.bob.status, "kicked")
+        with self.assertRaises(GameError):
+            self.room.join("Bob")
+        copy = Room.from_dict(self.room.to_dict())        # the kick is replicated
+        self.assertTrue(copy.players[self.bob.id].kicked)
+
+    def test_waiting_and_done_players_are_not_afk(self):
+        self.room.last_active[self.bob.id] = -1e9          # long ago, but the game has not started
+        self.assertEqual(self.room.afk_players(), [])
+        self.room.start()
+        self.room.guess(self.alice.id, new_id(), self.room.secret)  # Alice is done
+        self.room.last_active[self.alice.id] -= config.AFK_TIMEOUT + 1
+        self.assertEqual(self.room.afk_players(), [])
+
+    def test_kicking_the_last_guesser_completes_the_round(self):
+        self.room.start()
+        self.room.guess(self.alice.id, new_id(), self.room.secret)
+        self.room.kick(self.bob.id)
+        self.assertTrue(self.room.round_complete())
+
+    def test_game_ends_when_nobody_is_left(self):
+        self.room.start()
+        self.room.kick(self.alice.id)
+        self.room.remove_player(self.bob.id)
+        self.assertFalse(self.room.nobody_left())          # Bob may still come back
+        self.room.disconnected_since[self.bob.id] -= config.REJOIN_GRACE + 1
+        self.assertTrue(self.room.nobody_left())
+
+    def test_summary_counts_online_players(self):
+        self.room.start()
+        self.room.remove_player(self.bob.id)
+        s = self.room.summary()
+        self.assertEqual((s["online"], s["players"]), (1, 2))
+
     def test_seat_expires_after_grace_period(self):
         self.room.start()
         self.room.set_connected(self.bob.id, False)

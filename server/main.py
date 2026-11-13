@@ -8,7 +8,7 @@ about guesses and winners, and replicates every change to the room's backup (rep
 which takes over when the host crashes.
 
 Threads: TCP listener, UDP broadcast listener, heartbeat sender/listener/monitor, room reporter,
-one handler per TCP connection (clients and short-lived server-to-server requests share the
+AFK monitor, one handler per TCP connection (clients and short-lived server-to-server requests share the
 TCP port).
 
 Run from the repository root:  python -m server.main [--port 6000] [--broadcast 192.168.0.255]
@@ -82,6 +82,7 @@ class GameServer:
         threading.Thread(target=self._accept_loop, args=(listener,), name="tcp-listener",
                          daemon=True).start()
         threading.Thread(target=self._report_loop, name="room-reporter", daemon=True).start()
+        threading.Thread(target=self._afk_loop, name="afk-monitor", daemon=True).start()
         self.heartbeat.start()
         self.discovery.start()
         self.discovery.join_group()
@@ -109,7 +110,7 @@ class GameServer:
             for r in v.rooms.values():
                 backup = r.get("backup")
                 lines.append(f"  {r['room_id']} {r['name']:<12} {r['state']:<8} "
-                             f"{r['players']} players  host {r['host'][:8]}  "
+                             f"{r.get('online', '?')} online / {r['players']} players  host {r['host'][:8]}  "
                              f"backup {backup[:8] if backup else '-'}")
         with self.rooms_lock:
             hosted = list(self.rooms.values())
@@ -242,7 +243,7 @@ class GameServer:
             raise GameError("no server available")
         backup = self.view.successor(host)  # None while there is only one server
         self.view.set_room({"room_id": room_id, "name": name, "state": "waiting",
-                            "players": 0, "host": host, "backup": backup})
+                            "players": 0, "online": 0, "host": host, "backup": backup})
         log.info("room %s (%s) placed on %s, backup %s", room_id, name, host[:8],
                  backup[:8] if backup else "-")
         self.push_view()
@@ -303,35 +304,73 @@ class GameServer:
         session.send(p.make_msg(p.PONG, self.server_id))
 
     def on_join(self, session, msg):
+        """New player before the start; during the game a rejoin by name of an offline player."""
         if session.player_id:
             raise GameError("already in a room")
         room = self._room(msg.get("room_id"))
         with room.lock:
-            player = room.add_player(str(msg.get("name", "")))
-            session.player_id, session.room_id = player.id, room.id
-            with self.sessions_lock:
-                self.sessions[player.id] = session
-            self._replicate(room)
-        log.info("%s joined room %s", player.name, room.id)
-        session.send(p.make_msg(p.JOINED, self.server_id, room=room.summary(),
-                                player_id=player.id, name=player.name))
-        self._broadcast_room_update(room)
+            player, rejoined = room.join(str(msg.get("name", "")))
+            self._admit(session, room, player, rejoined)
 
     def on_rejoin(self, session, msg):
-        """A player comes back after a crash of its client or of the room's old host."""
+        """Automatic rejoin with the player ID after a crash of the room's old host."""
         room = self._room(msg.get("room_id"))
         with room.lock:
-            player = room.rejoin(msg.get("player_id"))
-            session.player_id, session.room_id = player.id, room.id
-            with self.sessions_lock:
-                self.sessions[player.id] = session
-            self._replicate(room)
+            self._admit(session, room, room.rejoin(msg.get("player_id")), rejoined=True)
+
+    def _admit(self, session, room, player, rejoined):
+        """Bind the connection to the player and tell everybody. Call with room.lock held."""
+        session.player_id, session.room_id = player.id, room.id
+        with self.sessions_lock:
+            self.sessions[player.id] = session
+        self._replicate(room)
+        if rejoined:
             log.info("%s REJOINED room %s (score %d)", player.name, room.id, player.score)
             session.send(p.make_msg(p.JOINED, self.server_id, room=room.summary(),
                                     player_id=player.id, name=player.name, rejoined=True,
                                     round=room.round, rounds=config.ROUNDS,
                                     attempts=player.attempts, score=player.score))
-            self._broadcast_room_update(room)
+        else:
+            log.info("%s joined room %s", player.name, room.id)
+            session.send(p.make_msg(p.JOINED, self.server_id, room=room.summary(),
+                                    player_id=player.id, name=player.name))
+        self._broadcast_room_update(room)
+
+    # --- Inactivity (on the room's host) ---------------------------------------------------
+    def _afk_loop(self):
+        """Every second: remove AFK players, end games in which nobody is left."""
+        while True:
+            time.sleep(1)
+            with self.rooms_lock:
+                rooms = list(self.rooms.values())
+            for room in rooms:
+                with room.lock:
+                    # Re-check after each kick: a kick can end the round and reset all clocks.
+                    while room.afk_players():
+                        self._kick(room, room.afk_players()[0])
+                    if room.nobody_left():
+                        log.info("room %s: nobody left, game over", room.id)
+                        room.end_game()
+                        self._replicate(room)
+                        self._report_room(room)
+
+    def _kick(self, room, player):
+        room.kick(player.id)
+        log.warning("%s KICKED from room %s (no guess for %.0f s)", player.name, room.id,
+                    config.AFK_TIMEOUT)
+        with self.sessions_lock:
+            session = self.sessions.pop(player.id, None)
+        if session:
+            session.send(p.make_msg(p.KICKED, self.server_id,
+                                    reason=f"no guess for {config.AFK_TIMEOUT:.0f} s"))
+            try:
+                session.conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        self._replicate(room)
+        self._broadcast_room_update(room)
+        # The kicked player may have been the last one the round was waiting for.
+        self._advance_if_round_complete(room)
 
     def on_start(self, session, msg):
         room = self._session_room(session)

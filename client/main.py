@@ -24,8 +24,8 @@ from common import config, protocol as p
 HELP = """Commands:
   list            search for games (UDP broadcast)
   create <name>   create a room and join it
-  join <room_id>  join a room
-  start           start the game (at least 2 players)
+  join <room_id>  join a room (during a game: get your seat back with the same name)
+  start         start the game (at least 2 players)
   <number>        guess a number
   leave           leave the room
   quit            exit"""
@@ -42,6 +42,7 @@ class Client:
         self.leader = None           # (ip, port) from the last GAME_LIST
         self.rooms = {}              # room_id -> room info from the last GAME_LIST
         self.conn = None             # TCP connection to the current room's host
+        self.admitted = False        # the host has accepted us on self.conn (JOINED)
         self._send_lock = threading.Lock()
 
     # --- Discovery -----------------------------------------------------------------------
@@ -72,10 +73,12 @@ class Client:
         return False
 
     def _print_rooms(self):
+        print(f"Leader: {self.leader[0]}:{self.leader[1]}")
         if not self.rooms:
             print("No open rooms. Create one with: create <name>")
         for r in self.rooms.values():
-            print(f"  {r['room_id']}  {r['name']:<16} {r['players']}/{r['max_players']}  "
+            # .get(): servers of an older version do not send the online count
+            print(f"  {r['room_id']}  {r['name']:<16} {r.get('online', '?')} online / {r['players']} players  "
                   f"{r['state']:<8} host {r['host']['ip']}:{r['host']['port']}")
 
     # --- Lobby commands ------------------------------------------------------------------
@@ -114,6 +117,7 @@ class Client:
         host = self.rooms[room_id]["host"]
         conn = socket.create_connection((host["ip"], host["port"]), timeout=config.PING_TIMEOUT)
         self.conn = conn
+        self.admitted = False  # becomes True with JOINED
         threading.Thread(target=self.receive_loop, args=(conn,), name="receiver", daemon=True).start()
         threading.Thread(target=self.ping_loop, args=(conn,), name="pinger", daemon=True).start()
 
@@ -195,6 +199,7 @@ class Client:
         if t == p.PONG:
             return
         if t == p.JOINED:
+            self.admitted = True
             self.player_id, self.room_id = msg["player_id"], msg["room"]["room_id"]
             if msg.get("rejoined"):
                 print(f"Back in room {self.room_id} (round {msg['round']}/{msg['rounds']}, "
@@ -203,8 +208,10 @@ class Client:
                 print(f"Joined room {self.room_id} as {msg['name']}. "
                       f"Type 'start' when everyone is in.")
         elif t == p.ROOM_UPDATE:
-            names = ", ".join(pl["name"] + ("" if pl["connected"] else " (offline)")
-                              for pl in msg["players"])
+            status = [pl.get("status", "online" if pl["connected"] else "offline")
+                      for pl in msg["players"]]
+            names = ", ".join(pl["name"] + ("" if s == "online" else f" ({s})")
+                              for pl, s in zip(msg["players"], status))
             print(f"Players in room: {names}")
         elif t == p.ROUND_START:
             print(f"\n=== Round {msg['round']}/{msg['rounds']}: guess a number between "
@@ -225,8 +232,18 @@ class Client:
         elif t == p.GAME_OVER:
             best = msg["scores"][0]
             print(f"\n*** Game over! Winner: {best['name']} with {best['score']} points ***")
+        elif t == p.KICKED:
+            # Forget the room before the host closes the connection: no automatic rejoin.
+            self.conn = self.player_id = self.room_id = self.pending_guess = None
+            print(f"\n!! Removed from the game for inactivity ({msg['reason']}). "
+                  f"Type 'list' to search for games.")
         elif t == p.ERROR:
             print(f"Error: {msg['reason']}")
+            if self.conn and not self.admitted:
+                # JOIN or REJOIN refused: drop the connection and go back to the lobby.
+                conn, self.conn = self.conn, None
+                self.player_id = self.room_id = self.pending_guess = None
+                conn.close()
         else:
             print(f"(unhandled message {t})")
 

@@ -24,6 +24,10 @@ In the client: `list` (search for games), `create <name>` (the leader places the
 server with the fewest rooms; you join it), `join <room_id>`, `start`, then type numbers to guess.
 `quit` exits.
 
+Players who lose their connection during a game (crash, closed window, `leave`) keep their seat
+for 60 s and get it back with `join <room_id>` and the same name. A connected player who sends no
+guess for 30 s while still having to guess is removed from the game for good (AFK).
+
 Press Enter in a server window to print its status (role, ring, room table, hosted rooms,
 backup copies). The demo script is in [DEMO.md](DEMO.md).
 
