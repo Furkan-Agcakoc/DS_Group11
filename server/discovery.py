@@ -33,9 +33,11 @@ class Discovery:
 
     def start(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Options must be set before bind(). SO_REUSEADDR lets several servers on one machine share
-        # the broadcast port (for local tests).
+        # Options must be set before bind(). They let several servers on one machine share the
+        # broadcast port (for local tests): SO_REUSEADDR on Windows, SO_REUSEPORT on macOS/Linux.
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self.sock.bind(("", config.BROADCAST_PORT))
         threading.Thread(target=self._listen, name="udp-listener", daemon=True).start()
